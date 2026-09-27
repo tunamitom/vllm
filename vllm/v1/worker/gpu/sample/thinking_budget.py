@@ -126,6 +126,7 @@ class ThinkingBudgetState:
             self.thinking_token_budget.gpu,
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
+            self.req_states.prompt_len.gpu,
             input_ids,
             expanded_local_pos,
             self.cached_last_start,
@@ -163,6 +164,7 @@ def _update_committed_marker_cache_kernel(
     all_token_ids_ptr,
     all_token_ids_stride,
     total_len_ptr,
+    prompt_len_ptr,
     cached_last_start_ptr,
     cached_last_end_ptr,
     cached_scan_pos_ptr,
@@ -179,6 +181,34 @@ def _update_committed_marker_cache_kernel(
         return
 
     total_len = tl.load(total_len_ptr + req_state_idx)
+    prompt_len = tl.load(prompt_len_ptr + req_state_idx)
+    # Reasoning markers must lie in the GENERATED region, not the prompt.
+    # An unclosed think-open inside the prompt (e.g. replayed history from
+    # an aborted reasoning turn) used to pre-exhaust the budget before the
+    # first sampled token, force-firing on step 1 of every affected
+    # request (2026-09-27 production incident). The chat template may
+    # place the think-open at the very tail of the prompt (MiMo/Qwen3
+    # templates end the generation prompt with the think-open marker
+    # right after the assistant turn header), so allow markers that
+    # BEGIN at any of the last len(marker) prompt positions: a marker
+    # ending exactly at the prompt tail still counts (for a single-token
+    # think-open that is the template-suffix position itself), while a
+    # marker beginning one position earlier or less is prompt content
+    # and must not count. This intentionally disables counting of
+    # prompt-EMBEDDED reasoning ("resumed reasoning" accounting): every
+    # request here carries a fresh, complete template. prompt_len (not
+    # prefill_len) keeps the boundary stable across preemption-resume, so
+    # budget accounting for the CURRENT turn's reasoning continues
+    # normally after a resume.
+    start_floor = prompt_len - START_LEN
+    if start_floor < 0:
+        start_floor = 0
+    end_floor = prompt_len - NATURAL_END_LEN
+    if end_floor < 0:
+        end_floor = 0
+    scan_floor = start_floor
+    if end_floor < scan_floor:
+        scan_floor = end_floor
     scan_pos = tl.load(cached_scan_pos_ptr + req_state_idx)
     last_start = tl.load(cached_last_start_ptr + req_state_idx)
     last_end = tl.load(cached_last_end_ptr + req_state_idx)
@@ -193,13 +223,17 @@ def _update_committed_marker_cache_kernel(
         # block with a marker; only the relative order of the two positions
         # found matters below.
         block_hi = total_len
-        while block_hi > 0 and last_start < 0 and last_end < 0:
+        while block_hi > scan_floor and last_start < 0 and last_end < 0:
             block_lo = block_hi - BLOCK
             if block_lo < 0:
                 block_lo = 0
             offs = block_lo + tl.arange(0, BLOCK)
 
-            start_match = (offs < block_hi) & (offs + START_LEN <= total_len)
+            start_match = (
+                (offs < block_hi)
+                & (offs + START_LEN <= total_len)
+                & (offs >= start_floor)
+            )
             for j in tl.static_range(0, START_LEN):
                 expected = tl.load(reasoning_start_token_ids_ptr + j)
                 actual = tl.load(
@@ -209,7 +243,11 @@ def _update_committed_marker_cache_kernel(
                 )
                 start_match = start_match & (actual == expected)
 
-            end_match = (offs < block_hi) & (offs + NATURAL_END_LEN <= total_len)
+            end_match = (
+                (offs < block_hi)
+                & (offs + NATURAL_END_LEN <= total_len)
+                & (offs >= end_floor)
+            )
             for j in tl.static_range(0, NATURAL_END_LEN):
                 expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
                 actual = tl.load(
@@ -223,8 +261,11 @@ def _update_committed_marker_cache_kernel(
             last_end = tl.max(tl.where(end_match, offs, -1), axis=0)
             block_hi = block_lo
     else:
-        for i in tl.range(scan_pos, total_len):
-            if i + START_LEN <= total_len:
+        scan_lo = scan_pos
+        if scan_lo < scan_floor:
+            scan_lo = scan_floor
+        for i in tl.range(scan_lo, total_len):
+            if i + START_LEN <= total_len and i >= start_floor:
                 start_match = True
                 for j in tl.static_range(0, START_LEN):
                     expected = tl.load(reasoning_start_token_ids_ptr + j)
@@ -235,7 +276,7 @@ def _update_committed_marker_cache_kernel(
                 if start_match:
                     last_start = i
 
-            if i + NATURAL_END_LEN <= total_len:
+            if i + NATURAL_END_LEN <= total_len and i >= end_floor:
                 end_match = True
                 for j in tl.static_range(0, NATURAL_END_LEN):
                     expected = tl.load(natural_reasoning_end_token_ids_ptr + j)
@@ -376,6 +417,7 @@ def apply_thinking_budget(
     thinking_token_budget: torch.Tensor,
     all_token_ids: torch.Tensor,
     total_len: torch.Tensor,
+    prompt_len: torch.Tensor,
     input_ids: torch.Tensor,
     expanded_local_pos: torch.Tensor,
     cached_last_start: torch.Tensor,
@@ -396,6 +438,7 @@ def apply_thinking_budget(
         all_token_ids,
         all_token_ids.stride(0),
         total_len,
+        prompt_len,
         cached_last_start,
         cached_last_end,
         cached_scan_pos,

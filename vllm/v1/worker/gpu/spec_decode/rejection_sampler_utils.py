@@ -1,10 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, tldevice, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_block_argmax, tl_rand32
 from vllm.v1.worker.gpu.sample.watermark import philox_gumbel_block_argmax
+
+logger = init_logger(__name__)
+
+# Debug aid for the thinking-budget forced-token path: when enabled, every
+# row carrying the 1e9 sentinel is logged (token, row, request, position)
+# so the committed token can be cross-checked against the guard's choice
+# during engine-level validation. Off by default; the check is a Python
+# bool test on the hot path.
+_TB_SENTINEL_LOG = os.environ.get("VLLM_TB_SENTINEL_LOG", "0") == "1"
 
 
 @triton.jit
@@ -848,6 +860,30 @@ def _resample_kernel(
         other=float("-inf"),
     ).to(tl.float32)
 
+    # Thinking-budget forced row: _thinking_budget_kernel writes a 1e9
+    # sentinel logit on the forced reasoning-end marker (pre-temperature,
+    # so it stays above 1e8 for any temperature <= 4). The stochastic
+    # residual path below has been observed (DFlash TP8, temperature > 0)
+    # to drop the forced token and commit a degenerate one-token repeat
+    # cycle instead, so bypass it: commit the forced token
+    # deterministically. Only the vocab block holding the sentinel takes
+    # this path; every other block of this row computes -inf residuals and
+    # loses the per-block argmax in _insert_resampled_kernel.
+    block_max = tl.max(target_logits, axis=0)
+    if block_max > 1.0e8:
+        forced_idx = tl.argmax(target_logits, axis=0)
+        tl.store(
+            resampled_local_argmax_ptr
+            + req_idx * resampled_local_argmax_stride
+            + block_idx,
+            block_idx * BLOCK_SIZE + forced_idx,
+        )
+        tl.store(
+            resampled_local_max_ptr + req_idx * resampled_local_max_stride + block_idx,
+            block_max,
+        )
+        return
+
     if is_bonus or not is_valid_rejected_draft:
         residual_logits = target_logits
     elif HAS_DRAFT_LOGITS:
@@ -1275,6 +1311,32 @@ def rejection_sample(
         VP_DRAFT=vp is not None,
         num_warps=1,
     )
+
+    if _TB_SENTINEL_LOG:
+        # Thinking-budget sentinel forensics (VLLM_TB_SENTINEL_LOG=1):
+        # log every row whose processed logits still carry the 1e9
+        # force sentinel, for both the vocab-parallel and standard
+        # resample paths below.
+        sentinel_rows = (
+            (target_local_max > 1.0e8).any(dim=1).nonzero().flatten()
+        )
+        for row in sentinel_rows.tolist():
+            req = int(expanded_idx_mapping[row].item())
+            # The sentinel is the row max by construction; argmax directly
+            # on the logits row (target_local_argmax is only populated for
+            # greedy requests).
+            tok = int(target_logits[row].argmax().item())
+            pos_in_req = int(expanded_local_pos[row].item())
+            t_idx = min(req, temperature.numel() - 1)
+            logger.info(
+                "thinking-budget sentinel: row=%d req=%d pos=%d token=%d "
+                "temp=%.2f",
+                row,
+                req,
+                pos_in_req,
+                tok,
+                float(temperature[t_idx].item()),
+            )
 
     if vp is not None:
         # Each rank Gumbel-samples its shard of the residual (or of the target

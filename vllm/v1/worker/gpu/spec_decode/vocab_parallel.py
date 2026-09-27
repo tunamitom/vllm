@@ -297,6 +297,21 @@ def _vp_resample_block_kernel(
         mask=mask,
         other=float("-inf"),
     ).to(tl.float32)
+    # Thinking-budget forced row (see _resample_kernel): the 1e9 sentinel
+    # logit written by _thinking_budget_kernel must survive rejection
+    # sampling. Bypass the stochastic residual path deterministically;
+    # only the shard holding the sentinel takes this path, every other
+    # shard computes -inf residuals for this row and loses the cross-rank
+    # argmax in resample_combine.
+    block_max = tl.max(target, axis=0)
+    if block_max > 1.0e8:
+        forced_idx = tl.argmax(target, axis=0)
+        tl.store(out_val_ptr + r * nblk + b, block_max)
+        tl.store(
+            out_idx_ptr + r * nblk + b,
+            (vocab_start + b * BLOCK_SIZE + forced_idx).to(tl.int64),
+        )
+        return
     if is_bonus or rejected < 0:
         residual = target
     else:

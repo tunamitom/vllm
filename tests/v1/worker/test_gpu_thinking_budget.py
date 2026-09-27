@@ -286,10 +286,35 @@ def test_v2_thinking_budget_clamps_oversized_budget():
     assert torch.all(out == 0)
 
 
-def test_v2_thinking_budget_continues_end_prefix_from_prompt():
-    """A resumed prompt ending with a partial forced-end marker must not
-    restart the marker sequence and duplicate its first token."""
+def test_v2_thinking_budget_ignores_resumed_prompt_reasoning():
+    """Prompt-embedded reasoning no longer counts against the budget.
+
+    Upstream used to count reasoning tokens from the last unclosed
+    think-open anywhere in the token stream, including the prompt. A
+    replayed history containing an aborted reasoning turn (unclosed
+    think-open early in a long prompt) pre-exhausted the budget before
+    the first sampled token, force-firing on step 1 (2026-09-27
+    production incident). Only GENERATED reasoning counts now.
+    """
     req_states = _make_req_states([1, START, 10, 11, END_A], prompt_len=5)
+    state = ThinkingBudgetState(req_states, MockMultiTokenEndReasoningConfig())
+    state.add_request(3, SamplingParams(thinking_token_budget=3))
+    state.apply_staged_writes()
+
+    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[END_A], local_pos=[0])
+
+    assert torch.all(out == 0)
+
+
+def test_v2_thinking_budget_continues_end_prefix_from_template_suffix():
+    """A generation prompt ending with the think-open marker (MiMo/Qwen3
+    templates end the generation prompt with the think-open marker)
+    still opens the reasoning window, and a partial forced-end marker at
+    the end of the generated tail continues from the next marker token."""
+    req_states = _make_req_states(
+        [1, 2, 3, 4, 5, START, 10, 11, END_A], prompt_len=6
+    )
     state = ThinkingBudgetState(req_states, MockMultiTokenEndReasoningConfig())
     state.add_request(3, SamplingParams(thinking_token_budget=3))
     state.apply_staged_writes()
@@ -299,3 +324,62 @@ def test_v2_thinking_budget_continues_end_prefix_from_prompt():
 
     assert out[0, END_B] == pytest.approx(1.0e9)
     assert out[0, END_A] == 0
+
+
+def test_v2_thinking_budget_ignores_unclosed_prompt_think_open():
+    """Regression (2026-09-27 production incident, arm B of the A/B/C
+    proof): an unclosed think-open deep inside the prompt (replayed
+    aborted reasoning) must NOT pre-exhaust the budget."""
+    tokens = [START, 10, 11] + [20] * 17
+    req_states = _make_req_states(tokens, prompt_len=20)
+    state = ThinkingBudgetState(req_states, MockReasoningConfig())
+    state.add_request(3, SamplingParams(thinking_token_budget=3))
+    state.apply_staged_writes()
+
+    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[20], local_pos=[0])
+
+    assert torch.all(out == 0)
+    # Second apply exercises the incremental scan path with the floor.
+    out2 = _apply(state, logits, input_ids=[20, 20], local_pos=[0, 1])
+    assert torch.all(out2 == 0)
+
+
+def test_v2_thinking_budget_counts_template_suffix_think_open():
+    """The think-open marker at prompt_len - START_LEN (chat-template
+    generation prompt) is within the allowed window and must count."""
+    req_states = _make_req_states(
+        [1, 2, 3, 4, 5, START, 10, 11, 12], prompt_len=6
+    )
+    state = ThinkingBudgetState(req_states, MockReasoningConfig())
+    state.add_request(3, SamplingParams(thinking_token_budget=3))
+    state.apply_staged_writes()
+
+    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[12], local_pos=[0])
+
+    assert out[0, END] == pytest.approx(1.0e9)
+
+
+def test_v2_thinking_budget_ignores_prompt_natural_ends():
+    """Natural-end markers inside the prompt (closed reasoning turns in
+    replayed history) must not close the CURRENT turn's reasoning window:
+    the end-marker scan shares the prompt floor, so the template
+    think-open at the prompt tail still opens the window and generated
+    reasoning still forces at the budget (review #5, gap 1; the
+    generated-region counterpart — a natural end after a generated
+    think-open disables the force via last_start <= last_end — is pinned
+    by test_v2_thinking_budget_latest_prefill_end_disables_forcing)."""
+    tokens = [
+        1, START, 10, 11, END, 20, 21, END, 30, 31, 32,
+        START, 40, 41, 42,
+    ]
+    req_states = _make_req_states(tokens, prompt_len=12)
+    state = ThinkingBudgetState(req_states, MockReasoningConfig())
+    state.add_request(3, SamplingParams(thinking_token_budget=3))
+    state.apply_staged_writes()
+
+    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[42], local_pos=[0])
+
+    assert out[0, END] == pytest.approx(1.0e9)
