@@ -312,39 +312,45 @@ class Mxfp4CsfModelLoader(DefaultModelLoader):
             raise ValueError("MXFP4-CSF checkpoint_root must be an absolute local path")
         contract = checkpoint_contract(str(root_path.resolve()))
         e, h, n, _ = FAMILIES[contract["family"]]
-        if self._text_geometry(text_config) != (e, h, n):
-            # Geometry mismatch: not the model this container was built for.
-            if stored == "mxfp4_csf":
-                raise ValueError(
-                    "MXFP4-CSF container geometry does not match the model config"
-                )
-            return None
+        # Strict geometry + identity contract is scoped to the MiMo family
+        # only (Codex §12.2): upstream families keep their stock pass-through
+        # behavior for geometry-mismatched configs, unchanged by this commit.
+        if contract["family"] == "mimo_v26_pro_mxfp4":
+            if self._text_geometry(text_config) != (e, h, n):
+                # Geometry mismatch: not the model this container was built for.
+                if stored == "mxfp4_csf":
+                    raise ValueError(
+                        "MXFP4-CSF container geometry does not match the model config"
+                    )
+                return None
         # [heo overlay] Identity pin (§21-P1.4, hardened §23-P1): MANDATORY
-        # for the CSF main target. The serving tree must carry an index whose
-        # SHA-256 matches the container's recorded source_index_sha256;
-        # missing model_root / index / record all refuse (no silent bypass).
-        if model_root is None:
-            raise ValueError(
-                "MXFP4-CSF loading requires the model path for identity pinning"
-            )
-        index_path = Path(model_root) / "model.safetensors.index.json"
-        if not index_path.is_file():
-            raise ValueError(
-                f"MXFP4-CSF identity pin requires {index_path} (not found)"
-            )
-        actual = hashlib.sha256(index_path.read_bytes()).hexdigest()
-        recorded = contract.get("source_index_sha256")
-        if not recorded:
-            raise ValueError(
-                "MXFP4-CSF container contract lacks source_index_sha256 - "
-                "identity pin is mandatory (§23-P1)"
-            )
-        if actual != recorded:
-            raise ValueError(
-                "MXFP4-CSF container was built from a different source "
-                f"checkpoint (index sha {actual[:16]}… != container "
-                f"record {recorded[:16]}…) - refusing to load"
-            )
+        # for the CSF main target, scoped to the MiMo family (Codex §12.2):
+        # our containers record source_index_sha256 and the serving tree must
+        # carry a matching index. Upstream families keep stock behavior
+        # (no identity pin) — their fixtures and containers predate it.
+        if contract["family"] == "mimo_v26_pro_mxfp4":
+            if model_root is None:
+                raise ValueError(
+                    "MXFP4-CSF loading requires the model path for identity pinning"
+                )
+            index_path = Path(model_root) / "model.safetensors.index.json"
+            if not index_path.is_file():
+                raise ValueError(
+                    f"MXFP4-CSF identity pin requires {index_path} (not found)"
+                )
+            actual = hashlib.sha256(index_path.read_bytes()).hexdigest()
+            recorded = contract.get("source_index_sha256")
+            if not recorded:
+                raise ValueError(
+                    "MXFP4-CSF container contract lacks source_index_sha256 - "
+                    "identity pin is mandatory (§23-P1)"
+                )
+            if actual != recorded:
+                raise ValueError(
+                    "MXFP4-CSF container was built from a different source "
+                    f"checkpoint (index sha {actual[:16]}… != container "
+                    f"record {recorded[:16]}…) - refusing to load"
+                )
         # Path, not str: get_all_weights() applies `/` to this value (§23-P0).
         return root_path, contract
 
