@@ -137,13 +137,14 @@ class Mxfp4CsfConfig(KimiMxfp4CsfConfig):
         )
         if is_mimo_hybrid:
             return cls.get_name()
-        if user_quant == cls.get_name():
-            # Explicit CSF request on a non-CSF checkpoint: fail loudly
-            # instead of silently degrading to plain FP8 (§23-P1).
-            raise ValueError(
-                "--quantization mxfp4_csf requested, but the checkpoint is "
-                "neither an MXFP4-CSF container nor the hybrid MiMo source"
-            )
+        # No match: return None and let vLLM's ordered-selection loop keep
+        # probing (config/model.py). An explicit --quantization mxfp4_csf on
+        # a non-CSF checkpoint then fails loudly at the post-loop config/model
+        # mismatch check ("Quantization method specified in the model config
+        # ... does not match ..."), never silently degrading to plain FP8.
+        # Raising here would break method enumeration: the loop calls every
+        # registered override unconditionally (tests/quantization/
+        # test_mxfp4_csf.py:391 asserts None for exact_mxfp4/kimi_x4t).
         return None
 
     @classmethod
