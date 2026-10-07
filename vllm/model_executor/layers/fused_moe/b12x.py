@@ -317,6 +317,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     # layer's scales, expanded ahead of the call (b12x expand_scales()).
     scales_expanded = False
 
+    # Set by the MiMo MXFP4-CSF method while the shared X4T scale scratch
+    # holds this layer's scales, expanded ahead of the call (b12x
+    # expand_scales() on the paired-program X4T payload). The W4A16 X4T
+    # runners then skip their inline decode_x4t_packed_scale_pair launch.
+    x4t_scales_expanded = False
+
     def __init__(
         self,
         moe_config: mk.FusedMoEConfig,
@@ -1067,7 +1073,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             raise ValueError("b12x MoE requires contiguous caller-owned workspace2")
         scratch = workspace2.view(-1).view(torch.uint8)
         tokens = int(hidden_states.shape[0])
-        expanded = {"scales_expanded": True} if self.scales_expanded else {}
+        expanded = {**({"scales_expanded": True} if self.scales_expanded else {}),
+                    **({"x4t_scales_expanded": True} if self.x4t_scales_expanded else {})}
         if (
             self._quant_mode == "w4a16"
             and _w4a16_a4_prefill_enabled()

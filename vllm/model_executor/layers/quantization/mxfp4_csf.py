@@ -33,6 +33,15 @@ class MimoMxfp4CsfConfig(Fp8Config):
 
     checkpoint_root: str
     scale_scratch: tuple | None
+    # Owner capability attribute for the X4T scale prefetch (Codex §9.1-3):
+    # the shared Mxfp4CsfMoEMethod arms only when this is True AND the env gate
+    # is on. Non-MiMo owners (DS4.1/DS4-Flash/Kimi) never set it, so they are
+    # bit-identical with the env off and unarmed even with it on. Set on the
+    # CLASS (not instances) so every per-layer method sees one shared owner.
+    x4t_scale_prefetch = True
+    # Shared prefetch state (scale_layers/scale_stream/scale_prefetch), one per
+    # owner; created in from_config. The method registers into it at load.
+    scale_prefetch_state = None
 
     @classmethod
     def get_name(cls):
@@ -72,6 +81,11 @@ class MimoMxfp4CsfConfig(Fp8Config):
         )
         result.checkpoint_root = root
         result.scale_scratch = None
+        # One prefetch state per owner (per model load): scale_layers, side
+        # stream and the pending (layer, token, event) triple live here.
+        from vllm.models.deepseek_v4_1.mxfp4_csf import MimoMxfp4CsfScalePrefetch
+
+        result.scale_prefetch_state = MimoMxfp4CsfScalePrefetch(layer_index=-1)
         return result
 
     def get_quant_method(self, layer, prefix):
