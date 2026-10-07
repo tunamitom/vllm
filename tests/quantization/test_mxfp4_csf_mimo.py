@@ -342,17 +342,23 @@ def _step(monkeypatch, *, starts, spec_tokens=3, gdn_prefills=None):
     """One forward-context step with a decodes-first batch (Codex 9.5 shape).
 
     Real-shaped host metadata: the paged metadata carries query_start_loc /
-    num_actual_tokens / max_query_len, and a backend that knows its own
-    spec-token count (KDA/GDN) reports the ACTUAL DFlash verification width
-    (num_spec_decode_tokens = spec_tokens) plus the batch's max query length
-    -- never the total token count, which would inflate the verification
-    width and misclassify prefill rows.
+    num_actual_tokens / max_query_len. ``gdn_prefills`` adds a second
+    (GDN/KDA-style) metadata entry whose ``num_spec_decode_tokens`` follows
+    the REAL gdn_attn.py:555 builder semantics: the AGGREGATE speculative
+    token count for the whole batch (sum of spec-decode query rows), NOT a
+    per-request width. Codex §10.2.2: ``_batch_has_prefill_rows`` must
+    classify with the speculative-config width only and IGNORE that
+    aggregate — an aggregate-as-width refinement lets many verification
+    requests suppress recognition of a shorter real prefill. (Production
+    MiMo's B12xPagedMetadata has no num_spec_decode_tokens field at all, so
+    MiMo behavior is unchanged; this fixture pins the corrected semantics
+    for backends that do report it.)
     """
     import vllm.config as vllm_config
     import vllm.forward_context as forward_context
 
-    # Production width source: the speculative config (B12xPagedMetadata does
-    # not carry num_spec_decode_tokens; KDA/GDN metadata refines it).
+    # Production width source: the speculative config only (B12xPagedMetadata
+    # does not carry num_spec_decode_tokens; GDN's aggregate is not a width).
     monkeypatch.setattr(
         vllm_config,
         "get_current_vllm_config_or_none",
@@ -369,9 +375,13 @@ def _step(monkeypatch, *, starts, spec_tokens=3, gdn_prefills=None):
         )
     }
     if gdn_prefills is not None:
+        # gdn_attn.py:555: num_spec_decode_tokens = total spec-decode rows.
+        # For a uniform-8 verification batch of n requests this is 8*n (the
+        # AGGREGATE), which is NOT any request's query width (that is 8).
+        spec_rows = starts[-1] - gdn_prefills * max_query if gdn_prefills else 0
         metadata["kda"] = SimpleNamespace(
             num_prefills=gdn_prefills,
-            num_spec_decode_tokens=spec_tokens,
+            num_spec_decode_tokens=spec_rows,
             max_query_len=max_query,
         )
     context = SimpleNamespace(attn_metadata=metadata)
@@ -439,6 +449,44 @@ def test_row_type_eligibility_rejects_dflash_verification_and_decode(monkeypatch
         lambda: SimpleNamespace(attn_metadata=None),
     )
     assert _batch_has_prefill_rows() is False
+
+
+def test_aggregate_spec_tokens_never_inflate_the_classification_width(monkeypatch):
+    """Codex §10.2.2: metadata ``num_spec_decode_tokens`` is the batch-wide
+    AGGREGATE speculative token count (gdn_attn.py:555), never a per-request
+    width. With MANY verification requests it can far exceed a shorter REAL
+    prefill query; treating it as a width would suppress arming for a batch
+    that does contain prefill rows. Classification must use the
+    speculative-config width (``_spec_decode_query_width``) only."""
+
+    from vllm.models.deepseek_v4_1.mxfp4_csf import _batch_has_prefill_rows
+
+    # DFlash7 verification requests (width 8 each) plus one 16-token prefill.
+    # The GDN aggregate (8 * 63 = 504 spec rows) dwarfs the 16-token prefill;
+    # the aggregate-as-width refinement would misread every query as
+    # decode-class and refuse to arm. The corrected classifier arms.
+    _step(
+        monkeypatch,
+        starts=[0] + [8 * (i + 1) for i in range(63)] + [8 * 63 + 16],
+        spec_tokens=7,
+        gdn_prefills=1,
+    )
+    assert _batch_has_prefill_rows() is True, (
+        "a batch with a real 16-token prefill must arm even when the "
+        "GDN aggregate spec-token count (504) exceeds that query length"
+    )
+
+    # Control: the same verification-heavy batch with NO prefill rows must
+    # still refuse to arm (the aggregate is ignored, not the prefill rows).
+    _step(
+        monkeypatch,
+        starts=[0] + [8 * (i + 1) for i in range(63)],
+        spec_tokens=7,
+        gdn_prefills=0,
+    )
+    assert _batch_has_prefill_rows() is False, (
+        "a pure verification batch must never arm, whatever its row count"
+    )
 
 
 def test_prefetch_off_is_unarmed(monkeypatch):
@@ -527,8 +575,9 @@ def test_stale_generation_is_awaited_and_never_reused(monkeypatch):
     assert backend.x4t_scales_expanded is False, "flag must be cleared in finally"
 
 
-def test_cancellation_clears_skip_flag_and_capture_drains(monkeypatch):
-    """A failed forward clears the per-call skip flag; capture drains."""
+def test_cancellation_clears_skip_flag_and_capture_clears_pending(monkeypatch):
+    """A failed forward clears the per-call skip flag; capture entry CLEARS
+    (not drains) a stale pending triple (Codex §10.1)."""
     from vllm.models.deepseek_v4_1.mxfp4_csf import MimoMxfp4CsfScalePrefetch
 
     main = _arm_stub_cuda(monkeypatch)
@@ -557,8 +606,12 @@ def test_cancellation_clears_skip_flag_and_capture_drains(monkeypatch):
         "the skip flag must be cleared in finally even on a failed forward"
     )
 
-    # Graph transition: capture disables new prefetch AND drains in-flight
-    # side-stream writes before captured work can use the shared buffers.
+    # Graph transition (Codex §10.1): capture entry CLEARS a pending triple
+    # WITHOUT waiting — an event wait inside capture raises
+    # cudaErrorStreamCaptureIsolation (invalidating the capture) even for a
+    # completed event, and the serving runner device-synchronizes BEFORE
+    # capture so the side-stream expansion is already complete. Draining
+    # (waiting) here is not merely unnecessary, it is illegal.
     inflight = _FakeEvent()
     state.scale_prefetch = (3, 1, inflight)
     monkeypatch.setattr(
@@ -567,10 +620,14 @@ def test_cancellation_clears_skip_flag_and_capture_drains(monkeypatch):
     )
     method.moe_kernel = SimpleNamespace(apply=lambda **_: "captured")
     assert method.apply(layer, x, None, None, None, None) == "captured"
-    assert inflight in main.waits, (
-        "capture must drain prior side-stream writes, not just early-return"
+    assert state.scale_prefetch is None, (
+        "capture entry must CLEAR the pending triple (the captured graph "
+        "runs inline and can never consume it)"
     )
-    assert state.scale_prefetch is None
+    assert inflight not in main.waits, (
+        "capture entry must NOT wait the pending event: an event wait inside "
+        "capture raises cudaErrorStreamCaptureIsolation (§10.1)"
+    )
 
 
 def test_mixed_decode_prefill_arms_for_prefill_rows_only(monkeypatch):

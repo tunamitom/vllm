@@ -61,12 +61,24 @@ def _batch_has_prefill_rows() -> bool:
 
     Row-type eligibility, never a total-row threshold: a batch qualifies only
     when some request's query exceeds the decode/verification width
-    (``1 + num_speculative_tokens``, taken from the speculative config and
-    from any metadata that reports its own spec-token count). DFlash
-    verification batches (uniform 1+spec-token queries) and pure decode
+    (``1 + num_speculative_tokens``, taken from the speculative config).
+    DFlash verification batches (uniform 1+spec-token queries) and pure decode
     batches never qualify, whatever their row count. Host-side metadata only
     (``max_query_len``): no device read, no synchronization. Missing metadata
     means no arming.
+
+    Codex §10.2.2 correction: the classification width is derived from the
+    SPECULATIVE CONFIG ONLY (``_spec_decode_query_width``). Metadata
+    ``num_spec_decode_tokens`` is deliberately NOT consulted: in the real
+    builder (``gdn_attn.py:555``) it is the AGGREGATE speculative token
+    count for the whole batch (``query_lens.sum() - prefill_tokens -
+    decode_tokens``), not a per-request width. Refining the width with that
+    aggregate lets many verification requests inflate it past a shorter REAL
+    prefill query and suppress arming for a batch that does contain prefill
+    rows. Production MiMo's ``B12xPagedMetadata`` has no
+    ``num_spec_decode_tokens`` field at all, so this correction cannot change
+    MiMo behavior -- it fixes the semantics for backends (GDN/KDA) that do
+    report it.
     """
     from vllm.forward_context import (
         get_forward_context,
@@ -86,12 +98,6 @@ def _batch_has_prefill_rows() -> bool:
             if isinstance(entry, dict):
                 values.extend(entry.values())
     width = _spec_decode_query_width()
-    for value in values:
-        # Backends that know their own spec-token count (KDA/GDN) refine the
-        # config-derived width; B12xPagedMetadata relies on the config alone.
-        spec_tokens = getattr(value, "num_spec_decode_tokens", None)
-        if isinstance(spec_tokens, int):
-            width = max(width, 1 + int(spec_tokens))
     return any(
         isinstance(getattr(value, "max_query_len", None), int)
         and int(value.max_query_len) > width
@@ -141,9 +147,12 @@ class MimoMxfp4CsfScalePrefetch:
       generation still needs that wait (§9.3 point 3/4).
     * The per-call consumer skip flag is set only for the matching
       (layer, forward-token) and cleared in ``finally``.
-    * CUDA-graph capture: new prefetch is disabled AND any pending side-stream
-      write is drained (waited) before captured work can touch the shared
-      buffers — early-return alone is not a sync policy.
+    * CUDA-graph capture: new prefetch is disabled and any pending triple is
+      CLEARED at capture entry without waiting (Codex §10.1) — the serving
+      runner device-synchronizes before capture, and adopting an external
+      event dependency inside a capture raises
+      cudaErrorStreamCaptureIsolation even for a completed event; the
+      captured graph runs inline (flag never declared under capture).
     * Eligibility is per-row-type (``_batch_has_prefill_rows``): DFlash
       verification and pure-decode batches never arm (Codex 9.5).
 
@@ -164,7 +173,16 @@ class MimoMxfp4CsfScalePrefetch:
             self.scale_stream = torch.cuda.Stream(device)
 
     def drain(self) -> None:
-        """Wait out any in-flight side-stream expansion (capture transition)."""
+        """Wait out any in-flight side-stream expansion OUTSIDE capture only.
+
+        Codex §10.1: this is the EAGER-transition helper (a caller that is NOT
+        capturing and wants a device-ordered join). The capture transition no
+        longer calls it: the serving runner synchronizes the device before
+        capture begins, and waiting an externally-recorded event INSIDE a
+        capture raises cudaErrorStreamCaptureIsolation (invalidating the
+        capture) even for a completed event — ``apply()``'s capture branch
+        therefore clears the pending triple WITHOUT waiting.
+        """
         pending = self.scale_prefetch
         self.scale_prefetch = None
         if pending is not None:
@@ -447,10 +465,25 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
             return run()
         stream = torch.cuda.current_stream()
         if _is_current_stream_capturing():
-            # Codex §9.3 point 4: during CUDA-graph capture disable new
-            # prefetch AND drain prior side-stream writes before the graph can
-            # use the shared buffers. Early-return alone is not a sync policy.
-            owner.drain()
+            # Codex §10.1: capture-entry CLEAR-ONLY, never a wait. The real
+            # serving capture path (gpu_model_runner.capture_model /
+            # _warmup_and_capture) performs a device-wide
+            # torch.accelerator.synchronize() BEFORE entering capture (and
+            # torch.cuda.graph's own entry does torch.cuda.synchronize()), so
+            # any side-stream expansion armed by an earlier forward is already
+            # complete when capture begins: there is nothing left to wait.
+            # Waiting inside capture is not merely unnecessary, it is ILLEGAL:
+            # cudaStreamWaitEvent on an externally-recorded event inside a
+            # capture raises cudaErrorStreamCaptureIsolation and invalidates
+            # the capture -- even when the event has already completed (pinned
+            # empirically on this build; the captured graph must never adopt
+            # an external event dependency). So the transition drops the
+            # pending triple without touching the event. The captured graph
+            # runs flag-OFF/inline anyway (new arming is disabled under
+            # capture below and the flag is never declared inside capture),
+            # so the cleared triple cannot be missed: each replay re-expands
+            # inline exactly as if no prefetch had ever been armed.
+            owner.scale_prefetch = None
             return run()
         token = _forward_token()
         # Codex §9.3 point 3: consume-or-drop the pending prefetch, but always
