@@ -19,7 +19,6 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.b12x import (
     B12xExperts,
     _is_current_stream_capturing,
-    _num_leading_decode_tokens,
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
@@ -388,9 +387,10 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
         # MiMo-owned X4T scale prefetch (Codex §9.2/§9.3): default OFF, owner
         # capability attribute only (never an isinstance check against the
         # MiMo config, which would be a circular import for non-MiMo owners).
+        # Codex review fix: the two CUDA events exist only for an ARMED layer
+        # -- with the gate OFF nothing is allocated (gate-OFF cost is zero,
+        # not "small").
         self.scale_prefetch_owner = None
-        self.moe_done = torch.cuda.Event()
-        self.scales_ready = torch.cuda.Event()
         if (
             getattr(self.owner, "x4t_scale_prefetch", False)
             and self.activation_mode == "a16"
@@ -399,6 +399,8 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
         ):
             state = getattr(self.owner, "scale_prefetch_state", None)
             if state is not None:
+                self.moe_done = torch.cuda.Event()
+                self.scales_ready = torch.cuda.Event()
                 self.scale_prefetch_owner = state
                 state.register(self, device)
         logger.info(
@@ -483,30 +485,64 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
             side = owner.scale_stream
             side.wait_event(self.moe_done)
             with torch.cuda.stream(side):
-                b12x_fused_moe.expand_scales(following.prepared)
-                following.scales_ready.record(side)
-            owner.scale_prefetch = (
-                following.layer_index,
-                token,
-                following.scales_ready,
-            )
+                # Codex review fix: publish the (layer, token, event) triple
+                # ONLY after expand_scales() returns True. Its Boolean is the
+                # readiness contract -- fail closed on False (nothing was
+                # enqueued; no event, no pending triple) and, if it RAISES
+                # after side-stream work may already be enqueued over the
+                # shared scratch, preserve a dependency that later scratch
+                # reuse must wait: an await-only triple whose token is None
+                # can never match a live forward (consumption requires a
+                # real forward token), so it is drained/waited and dropped,
+                # never consumed.
+                try:
+                    expanded = bool(
+                        b12x_fused_moe.expand_scales(following.prepared)
+                    )
+                except Exception:
+                    following.scales_ready.record(side)
+                    owner.scale_prefetch = (
+                        following.layer_index,
+                        None,
+                        following.scales_ready,
+                    )
+                    raise
+                if expanded:
+                    following.scales_ready.record(side)
+                    owner.scale_prefetch = (
+                        following.layer_index,
+                        token,
+                        following.scales_ready,
+                    )
         return result
 
     def _expands(self, x: torch.Tensor) -> bool:
         """Whether this call's consumers expand X4T scales inline.
 
-        Codex §9.5: arm only for actual eligible prefill rows, never a
-        total-row threshold — DFlash verification batches and mixed
-        decode/prefill splits carry many decode rows and must not arm for
-        them. The consumer's skip is per whole call (the X4T runners skip
-        their inline decode for the entire call), so the producer only arms
-        when the call is row-type eligible (checked by the caller).
-        """
-        from vllm.model_executor.layers.fused_moe.b12x import (
-            _w4a16_a4_prefill_enabled,
-        )
+        Codex review fix (P1): eligibility is derived from the PREPARED X4T
+        CONSUMER, never from the NVFP4 knob. The reviewed commit consulted
+        ``_w4a16_a4_prefill_enabled()`` (``B12X_W4A16_A4_PREFILL_MIN_TOKENS``,
+        an NVFP4 switch) while the MiMo launcher sets
+        ``B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS`` and leaves the NVFP4 knob
+        unset, so production MiMo never armed. For a prepared X4T W4A16
+        payload every consumer expands the routed experts' scales inline on
+        every call -- the A16 runners (small-M direct arm, packed/direct
+        route predecode) and the MXFP4 A4 prefill runner (its own
+        ``B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS`` admission) -- so the payload
+        retaining the paired-plane capability IS the eligibility, and the
+        knobs only pick WHICH consumer runs. A16 prefill expansion is an
+        explicitly supported case, not an NVFP4 side effect.
 
-        tokens = int(x.shape[0])
-        if _w4a16_a4_prefill_enabled():
-            return _num_leading_decode_tokens(tokens) < tokens
-        return False
+        Codex §9.5 still holds: this says the consumer expands inline, not
+        that this call should arm -- the caller separately requires actual
+        prefill rows (``_batch_has_prefill_rows``) and CUDA-graph capture
+        excludes arming in ``apply``. Row classification uses the host
+        metadata's verification width (``num_spec_decode_tokens`` via
+        ``_spec_decode_query_width``), never
+        ``_num_leading_decode_tokens`` (that helper assumes query width <= 4
+        and reads ``query_start_loc.tolist()``; it is not a DFlash7
+        classifier and is not used here).
+        """
+        prepared = getattr(self, "prepared", None)
+        capability = getattr(getattr(prepared, "_impl", None), "x4t_prefetch", None)
+        return capability is not None

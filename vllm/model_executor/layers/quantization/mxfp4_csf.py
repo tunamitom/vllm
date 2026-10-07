@@ -83,9 +83,13 @@ class MimoMxfp4CsfConfig(Fp8Config):
         result.scale_scratch = None
         # One prefetch state per owner (per model load): scale_layers, side
         # stream and the pending (layer, token, event) triple live here.
+        # Codex review fix (P1): the state is owner-wide and the constructor
+        # takes no arguments -- the reviewed commit passed layer_index=-1 and
+        # broke every MiMo load (from_config raised TypeError with the
+        # prefetch gate OFF or ON).
         from vllm.models.deepseek_v4_1.mxfp4_csf import MimoMxfp4CsfScalePrefetch
 
-        result.scale_prefetch_state = MimoMxfp4CsfScalePrefetch(layer_index=-1)
+        result.scale_prefetch_state = MimoMxfp4CsfScalePrefetch()
         return result
 
     def get_quant_method(self, layer, prefix):

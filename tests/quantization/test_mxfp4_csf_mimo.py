@@ -262,11 +262,14 @@ def test_mimo_hybrid_intent_with_csf_root_resolves(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _stub_method(owner, index, *, backend=None):
+def _stub_method(owner, index, *, backend=None, prepared=None):
     """A Mxfp4CsfMoEMethod with the prefetch fields but no weights.
 
     ``owner`` is the prefetch STATE (MimoMxfp4CsfScalePrefetch); the owner
-    namespace mirrors MimoMxfp4CsfConfig's capability contract.
+    namespace mirrors MimoMxfp4CsfConfig's capability contract. ``prepared``
+    defaults to a fake X4T payload: a namespace whose ``_impl`` retains the
+    paired-plane capability, which is what the (fixed) eligibility derivation
+    and the load-time support check consult.
     """
     from vllm.models.deepseek_v4_1.mxfp4_csf import Mxfp4CsfMoEMethod
 
@@ -285,7 +288,11 @@ def _stub_method(owner, index, *, backend=None):
     )
     method.moe_done = SimpleNamespace(record=lambda stream: None)
     method.scales_ready = SimpleNamespace(record=lambda stream: None)
-    method.prepared = f"layer-{index}"
+    method.prepared = (
+        prepared
+        if prepared is not None
+        else SimpleNamespace(_impl=SimpleNamespace(x4t_prefetch=object()))
+    )
     method.moe_kernel = SimpleNamespace()
     return method
 
@@ -332,7 +339,15 @@ def _arm_stub_cuda(monkeypatch):
 
 
 def _step(monkeypatch, *, starts, spec_tokens=3, gdn_prefills=None):
-    """One forward-context step with a decodes-first batch (Codex 9.5 shape)."""
+    """One forward-context step with a decodes-first batch (Codex 9.5 shape).
+
+    Real-shaped host metadata: the paged metadata carries query_start_loc /
+    num_actual_tokens / max_query_len, and a backend that knows its own
+    spec-token count (KDA/GDN) reports the ACTUAL DFlash verification width
+    (num_spec_decode_tokens = spec_tokens) plus the batch's max query length
+    -- never the total token count, which would inflate the verification
+    width and misclassify prefill rows.
+    """
     import vllm.config as vllm_config
     import vllm.forward_context as forward_context
 
@@ -345,18 +360,19 @@ def _step(monkeypatch, *, starts, spec_tokens=3, gdn_prefills=None):
             speculative_config=SimpleNamespace(num_speculative_tokens=spec_tokens)
         ),
     )
+    max_query = max(b - a for a, b in zip(starts, starts[1:]))
     metadata = {
         "attn": SimpleNamespace(
             query_start_loc=torch.tensor(starts, dtype=torch.int32),
             num_actual_tokens=starts[-1],
-            max_query_len=max(b - a for a, b in zip(starts, starts[1:])),
+            max_query_len=max_query,
         )
     }
     if gdn_prefills is not None:
         metadata["kda"] = SimpleNamespace(
             num_prefills=gdn_prefills,
-            num_spec_decode_tokens=starts[-1],
-            max_query_len=spec_tokens,
+            num_spec_decode_tokens=spec_tokens,
+            max_query_len=max_query,
         )
     context = SimpleNamespace(attn_metadata=metadata)
     monkeypatch.setattr(
@@ -559,16 +575,21 @@ def test_cancellation_clears_skip_flag_and_capture_drains(monkeypatch):
 
 def test_mixed_decode_prefill_arms_for_prefill_rows_only(monkeypatch):
     """Mixed decode/prefill splits: the producer arms only for a call with
-    actual prefill rows (row-type eligibility), never by total row count."""
-    import vllm.models.deepseek_v4_1.mxfp4_csf as mxfp4_module
+    actual prefill rows (row-type eligibility), never by total row count.
+
+    Codex review fix: eligibility is derived from the prepared X4T consumer
+    with the REAL environment readers -- the production MiMo environment
+    (B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS=512, NVFP4 knob UNSET) arms. The
+    reviewed commit consulted the NVFP4 knob and never armed; the old test
+    monkeypatched _w4a16_a4_prefill_enabled=True and masked that. No
+    eligibility helper is patched here.
+    """
     from vllm.models.deepseek_v4_1.mxfp4_csf import MimoMxfp4CsfScalePrefetch
 
+    monkeypatch.setenv("B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS", "512")
+    monkeypatch.delenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", raising=False)
     _arm_stub_cuda(monkeypatch)
     monkeypatch.setattr("vllm.envs.VLLM_B12X_MXFP4_CSF_SCALE_PREFETCH", True)
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.fused_moe.b12x._w4a16_a4_prefill_enabled",
-        lambda: True,
-    )
     expanded = []
 
     def fake_expand(prepared):
@@ -593,12 +614,9 @@ def test_mixed_decode_prefill_arms_for_prefill_rows_only(monkeypatch):
         apply_router_weight_on_input=False,
     )
 
-    # Mixed batch: 8 decode rows + 512 prefill rows. _num_leading_decode_tokens
-    # reports 8 -> the call is prefill-eligible -> arm for layer 4.
-    monkeypatch.setattr(
-        mxfp4_module, "_num_leading_decode_tokens", lambda tokens: 8
-    )
-    _step(monkeypatch, starts=[0, 8, 520])
+    # Mixed batch: 8 decode-class rows (DFlash7 verification width) + 512
+    # prefill rows. The call is prefill-eligible -> arm for layer 4.
+    _step(monkeypatch, starts=[0, 8, 520], spec_tokens=7, gdn_prefills=1)
     x = torch.zeros(520, 4)
     for method in layers.values():
         method.apply(layer, x, None, None, None, None)
@@ -609,9 +627,6 @@ def test_mixed_decode_prefill_arms_for_prefill_rows_only(monkeypatch):
     # Pure-decode batch (DFlash verification shape): 32 rows, 0 prefill rows.
     # Even with many rows, no arming (Codex 9.5).
     expanded.clear()
-    monkeypatch.setattr(
-        mxfp4_module, "_num_leading_decode_tokens", lambda tokens: tokens
-    )
     _step(monkeypatch, starts=[0, 8, 16, 24, 32], spec_tokens=7, gdn_prefills=0)
     x = torch.zeros(32, 4)
     for method in layers.values():
@@ -647,4 +662,226 @@ def test_first_and_last_layer_handled(monkeypatch):
     # prefetch (first call of the forward).
     last.apply(layer, torch.zeros(512, 4), None, None, None, None)
     assert calls == [False], "first/last layer must run the inline path"
+    assert state.scale_prefetch is None
+
+
+# ---------------------------------------------------------------------------
+# Codex §8 review fix tests (2026-10-07): the reviewed pair's P1 regressions.
+# ---------------------------------------------------------------------------
+
+
+def test_mimo_config_factory_constructs_prefetch_state_gate_off_and_on(monkeypatch, tmp_path):
+    """Codex §8.1 P1 regression: the REAL config factory must construct the
+    owner state with the prefetch gate OFF and ON.
+
+    The reviewed commit called MimoMxfp4CsfScalePrefetch(layer_index=-1) --
+    a constructor that takes no arguments -- so every
+    MimoMxfp4CsfConfig.from_config() raised TypeError and MiMo could not load
+    at all. Separate config instances must carry SEPARATE owner state (one
+    per model load); the loader-root resolution here needs no real
+    checkpoint because from_config never touches tensors.
+    """
+    from vllm.model_executor.layers.quantization.mxfp4_csf import (
+        MimoMxfp4CsfConfig,
+    )
+    from vllm.models.deepseek_v4_1.mxfp4_csf import MimoMxfp4CsfScalePrefetch
+
+    root = str(tmp_path / "unused-cpu-config-probe")
+
+    # Gate OFF (the default): construction must succeed -- this is the path
+    # every MiMo load takes even with the prefetch disabled.
+    monkeypatch.setattr("vllm.envs.VLLM_B12X_MXFP4_CSF_SCALE_PREFETCH", False)
+    cfg_off = MimoMxfp4CsfConfig.from_config({"checkpoint_root": root})
+    assert isinstance(cfg_off.scale_prefetch_state, MimoMxfp4CsfScalePrefetch)
+    assert cfg_off.scale_prefetch_state.scale_layers == {}
+    assert cfg_off.scale_prefetch_state.scale_prefetch is None
+
+    # Gate ON: same construction path, same owner contract.
+    monkeypatch.setattr("vllm.envs.VLLM_B12X_MXFP4_CSF_SCALE_PREFETCH", True)
+    cfg_on = MimoMxfp4CsfConfig.from_config({"checkpoint_root": root})
+    assert isinstance(cfg_on.scale_prefetch_state, MimoMxfp4CsfScalePrefetch)
+
+    # Separate config instances carry SEPARATE state: registering a layer on
+    # one owner never leaks into another (two model loads, two owners).
+    assert cfg_off.scale_prefetch_state is not cfg_on.scale_prefetch_state
+    method = _stub_method(cfg_on.scale_prefetch_state, 0)
+    cfg_on.scale_prefetch_state.scale_layers[0] = method
+    assert 0 not in cfg_off.scale_prefetch_state.scale_layers
+    assert cfg_off.scale_prefetch_state.scale_prefetch is None
+
+
+def test_expand_returns_false_never_publishes_a_pending_prefetch(monkeypatch):
+    """Codex §8.4: the (layer, token, event) triple is published ONLY after
+    expand_scales() returns True; False fails closed (no event recorded, no
+    pending triple) and an exception after enqueued side-stream work
+    publishes an await-only dependency (token None) that can never be
+    consumed but is always waited."""
+    from vllm.models.deepseek_v4_1.mxfp4_csf import MimoMxfp4CsfScalePrefetch
+
+    main = _arm_stub_cuda(monkeypatch)
+    monkeypatch.setattr("vllm.envs.VLLM_B12X_MXFP4_CSF_SCALE_PREFETCH", True)
+    monkeypatch.setenv("B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS", "512")
+    monkeypatch.delenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", raising=False)
+    import b12x.moe.fused_moe as fused_moe
+
+    state = MimoMxfp4CsfScalePrefetch()
+    layers = {i: _stub_method(state, i) for i in (3, 4)}
+    for method in layers.values():
+        state.scale_layers[method.layer_index] = method
+        method.moe_kernel = SimpleNamespace(apply=lambda **_: None)
+    layer = SimpleNamespace(
+        w13_weight=None,
+        w2_weight=None,
+        activation=None,
+        global_num_experts=4,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+    )
+    _step(monkeypatch, starts=[0, 8, 520], spec_tokens=7, gdn_prefills=1)
+    x = torch.zeros(520, 4)
+
+    # expand_scales -> False: nothing published, no readiness event recorded.
+    monkeypatch.setattr(fused_moe, "expand_scales", lambda prepared: False)
+    layers[4].scales_ready = _FakeEvent()
+    layers[3].apply(layer, x, None, None, None, None)
+    assert state.scale_prefetch is None, (
+        "expand_scales returning False must fail closed: no pending triple"
+    )
+    assert layers[4].scales_ready.recorded_on is None, (
+        "no readiness event may be recorded on False"
+    )
+
+    # expand_scales raises AFTER side-stream work may be enqueued: an
+    # await-only dependency (token None) is preserved for later scratch
+    # reuse -- waited, never consumed.
+    def boom(prepared):
+        raise RuntimeError("expansion failed mid-stream")
+
+    monkeypatch.setattr(fused_moe, "expand_scales", boom)
+    with pytest.raises(RuntimeError, match="expansion failed mid-stream"):
+        layers[3].apply(layer, x, None, None, None, None)
+    pending = state.scale_prefetch
+    assert pending is not None and pending[1] is None, (
+        "an exception after enqueued side-stream work must preserve an "
+        "await-only dependency"
+    )
+    # The next call waits it (scratch race protection) but never consumes it.
+    seen = []
+    layers[4].backend = SimpleNamespace(x4t_scales_expanded=False)
+    layers[4].moe_kernel = SimpleNamespace(
+        apply=lambda **_: seen.append(layers[4].backend.x4t_scales_expanded)
+    )
+    _step(monkeypatch, starts=[0, 8, 520], spec_tokens=7, gdn_prefills=1)
+    layers[4].apply(layer, x, None, None, None, None)
+    assert pending[2] in main.waits, "the await-only dependency must be waited"
+    assert seen == [False], "an await-only triple must never be consumed"
+    assert state.scale_prefetch is None
+
+
+def test_production_mimo_environment_arms_and_consumes_one_prefetch(monkeypatch):
+    """Codex §8.2 P1 regression: with the REAL environment readers -- the
+    production MiMo launcher environment (B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS
+    set, the NVFP4 knob B12X_W4A16_A4_PREFILL_MIN_TOKENS UNSET) -- a
+    DFlash7-configured forward with real-shaped host metadata actually
+    enqueues ONE prefetch and the next layer consumes it.
+
+    The reviewed _expands() consulted the NVFP4 knob and never armed in this
+    environment. Nothing eligibility-related is patched here: the real
+    _expands, the real _batch_has_prefill_rows (reading real-shaped
+    query_start_loc/num_actual_tokens/max_query_len metadata and the
+    DFlash7 speculative config), the real _b12x_x4t_prefetch_supported, and
+    the real env readers.
+    """
+    from vllm.models.deepseek_v4_1.mxfp4_csf import (
+        MimoMxfp4CsfScalePrefetch,
+        _b12x_x4t_prefetch_supported,
+        _forward_token,
+    )
+
+    # Production MiMo launcher environment: MXFP4 knob alone.
+    monkeypatch.setenv("B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS", "512")
+    monkeypatch.delenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", raising=False)
+    main = _arm_stub_cuda(monkeypatch)
+    monkeypatch.setattr("vllm.envs.VLLM_B12X_MXFP4_CSF_SCALE_PREFETCH", True)
+
+    # The NVFP4 reader (the WRONG knob the reviewed code consulted) stays
+    # False in this environment -- prove it with the real reader, unpatched.
+    from vllm.model_executor.layers.fused_moe.b12x import (
+        _w4a16_a4_prefill_enabled,
+    )
+
+    assert _w4a16_a4_prefill_enabled() is False, (
+        "the NVFP4 A4 knob must be unset in the production MiMo environment"
+    )
+
+    state = MimoMxfp4CsfScalePrefetch()
+    prepared = SimpleNamespace(_impl=SimpleNamespace(x4t_prefetch=object()))
+    # The real load-time support check accepts this prepared X4T payload.
+    assert _b12x_x4t_prefetch_supported(prepared) is True
+    layers = {i: _stub_method(state, i, prepared=prepared) for i in (3, 4)}
+    for method in layers.values():
+        state.scale_layers[method.layer_index] = method
+        method.moe_kernel = SimpleNamespace(apply=lambda **_: None)
+    # Track the real event-record ordering through the fake CUDA surface.
+    layers[3].moe_done = _FakeEvent()
+    layers[4].scales_ready = _FakeEvent()
+    layer = SimpleNamespace(
+        w13_weight=None,
+        w2_weight=None,
+        activation=None,
+        global_num_experts=4,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+    )
+
+    expanded = []
+    ready_events = []
+
+    def fake_expand(payload):
+        expanded.append(payload)
+        return True
+
+    import b12x.moe.fused_moe as fused_moe
+
+    monkeypatch.setattr(fused_moe, "expand_scales", fake_expand)
+
+    # DFlash7 config (num_speculative_tokens=7 -> verification width 8) and
+    # real-shaped host metadata: a decodes-first mixed batch whose last
+    # request is a 512-token prefill.
+    _step(monkeypatch, starts=[0, 8, 520], spec_tokens=7, gdn_prefills=1)
+    token = _forward_token()
+    x = torch.zeros(520, 4)
+
+    # Layer 3 runs: it must enqueue exactly ONE prefetch for layer 4.
+    layers[3].apply(layer, x, None, None, None, None)
+    assert expanded == [prepared], (
+        "the production MiMo environment (MXFP4 knob alone, NVFP4 unset) "
+        "must arm exactly one prefetch for the following layer"
+    )
+    assert state.scale_prefetch == (4, token, layers[4].scales_ready), (
+        "the pending triple must be (following layer, this forward's token, "
+        "the following layer's readiness event)"
+    )
+    # The side stream waited this layer's completion, and the readiness
+    # event was recorded on the side stream (real ordering, fake CUDA).
+    assert layers[3].moe_done.recorded_on is main
+    assert layers[4].scales_ready.recorded_on is state.scale_stream
+
+    # Layer 4 runs in the SAME forward: it waits the pending event and
+    # CONSUMES the prefetch (per-call skip flag set, cleared afterwards).
+    seen = []
+    layers[4].backend = SimpleNamespace(x4t_scales_expanded=False)
+    layers[4].moe_kernel = SimpleNamespace(
+        apply=lambda **_: seen.append(layers[4].backend.x4t_scales_expanded)
+    )
+    layers[4].apply(layer, x, None, None, None, None)
+    assert layers[4].scales_ready in main.waits, (
+        "the consumer must wait the pending readiness event"
+    )
+    assert seen == [True], (
+        "the matching (layer, token) generation must be consumed"
+    )
+    assert layers[4].backend.x4t_scales_expanded is False, (
+        "the skip flag must be cleared in finally"
+    )
     assert state.scale_prefetch is None
