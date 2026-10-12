@@ -20,6 +20,14 @@ Additions vs kk-beta 6008f020 (everything else verbatim):
     codec, so acceptance is not unconditional.
   * get_all_weights: the expert-skip regex also matches `mlp.experts`
     (MiMo namespace) alongside ffn/block_sparse_moe.
+  * [csfdelta 2026-10-12] `_load_mxfp4_csf_weights` constructs legacy-encoding
+    (`encoding="csf"`) `b12x.loader._csf_source.CsfSource` planes instead of
+    the pre-97fde4bd5 `CsfScalePlanes` type: FlashInfer 97fde4bd5/7e5a142e9
+    replaced per-expert host planes with CsfSource (batched components +
+    per-segment exception starts) and moved scale expansion onto CUDA, so
+    the old symbol no longer exists on the paired flashinfer kk-mimo branch
+    and its import failed at weight-load time. The sliced slab layout and
+    u24 exception words are byte-identical under both spellings.
 """
 
 import hashlib
@@ -202,7 +210,8 @@ def _load_mxfp4_csf_weights(
     stores, manifests and model-specific tensor names belong to the caller.
     Expanded scale buffers remain caller-owned for serialized layer execution.
     """
-    from b12x.moe.fused_moe import CsfScalePlanes, Mxfp4CsfWeights
+    from b12x.loader._csf_source import CsfSource
+    from b12x.moe.fused_moe import Mxfp4CsfWeights
 
     if num_experts <= 0 or hidden_size <= 0 or hidden_size % 64:
         raise ValueError("MXFP4-CSF requires experts and 64-aligned hidden channels")
@@ -263,11 +272,39 @@ def _load_mxfp4_csf_weights(
                 exceptions2.append(exceptions)
         fixed13.append(torch.cat(f13))
         exceptions13.append(torch.cat(e13))
+
+    def csf_source(fixed, exceptions, rows, columns):
+        """Batch sliced per-expert slab planes into one legacy ``CsfSource``.
+
+        The sliced planes already carry the checkpoint's row-base/selector slab
+        layout (16 base bytes followed by packed one-bit selector bytes per
+        16-row slab) and u24-position exception words; the FlashInfer
+        ``"csf"`` CsfSource encoding is byte-identical, so the slices upload
+        verbatim and the b12x preparation expands them into the native scale
+        layout on CUDA (FlashInfer 7e5a142e9) instead of the caller decoding
+        scale values on the host. ``starts`` segments the concatenated
+        exception words per expert.
+        """
+        sizes = [int(t.numel()) for t in exceptions]
+        starts = torch.zeros(len(sizes) + 1, dtype=torch.int64)
+        torch.cumsum(torch.tensor(sizes, dtype=torch.int64), 0, out=starts[1:])
+        return CsfSource(
+            (torch.stack(fixed), torch.cat(exceptions)),
+            starts,
+            rows,
+            columns,
+            "mxfp4",
+            len(sizes),
+            encoding="csf",
+        )
+
     return Mxfp4CsfWeights(
         w13=w13.to(device),
         w2=w2.to(device),
-        w13_scales=CsfScalePlanes(tuple(fixed13), tuple(exceptions13)),
-        w2_scales=CsfScalePlanes(tuple(fixed2), tuple(exceptions2)),
+        w13_scales=csf_source(
+            fixed13, exceptions13, 2 * local, hidden_size // 32
+        ),
+        w2_scales=csf_source(fixed2, exceptions2, hidden_size, local // 32),
         w13_scale_scratch=w13_scale_scratch,
         w2_scale_scratch=w2_scale_scratch,
     )
