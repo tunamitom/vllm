@@ -1847,9 +1847,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_CSF_SCALE_PREFETCH": lambda: bool(
         int(os.getenv("VLLM_B12X_CSF_SCALE_PREFETCH", "1"))
     ),
-    # MiMo-only: expand the next MXFP4-CSF (X4T) layer's expert scales on a
-    # side stream and skip its inline decode (default OFF; see
-    # MimoMxfp4CsfScalePrefetch).
+    # MiMo-only: expand the next MXFP4-CSF layer's expert scales on a side
+    # stream (native CSF decoder via b12x expand_scales) and skip the next
+    # call's inline decode (default OFF; see MimoMxfp4CsfScalePrefetch).
     "VLLM_B12X_MXFP4_CSF_SCALE_PREFETCH": lambda: bool(
         int(os.getenv("VLLM_B12X_MXFP4_CSF_SCALE_PREFETCH", "0"))
     ),

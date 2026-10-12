@@ -105,17 +105,19 @@ def _batch_has_prefill_rows() -> bool:
     )
 
 
-def _b12x_x4t_prefetch_supported(experts) -> bool:
-    """Whether b12x exposes prepared full-X4T expansion + consumer skip.
+def _b12x_csf_prefetch_supported(prepared) -> bool:
+    """Whether b12x exposes prepared CSF scale expansion + consumer skip.
 
     Requires both halves of the coordinated contract: ``expand_scales`` must
-    handle the paired-program X4T payload (prepared full-X4T expansion) and
-    ``bind`` must accept ``x4t_scales_expanded`` (consumer skip). Older b12x
+    handle this prepared payload (the ``nvfp4_csf`` decoder branch installed
+    by the FlashInfer CSF-block preparation — 97fde4bd5/7e5a142e9 made it
+    carry BOTH the NVFP4 and the MXFP4 compact-scale payloads) and ``bind``
+    must accept ``scales_expanded`` (the per-call consumer skip). Older b12x
     builds have neither; arming there would duplicate work (a side-stream
-    kernel with the inline decoder still running), so prefetch stays off.
+    expansion with the per-call decode still running), so prefetch stays off.
     Fails closed on any missing piece.
     """
-    if getattr(experts._impl, "x4t_prefetch", None) is None:
+    if getattr(getattr(prepared, "_impl", None), "nvfp4_csf", None) is None:
         return False
     try:
         import inspect
@@ -125,7 +127,7 @@ def _b12x_x4t_prefetch_supported(experts) -> bool:
 
         if not hasattr(fused_moe, "expand_scales"):
             return False
-        return "x4t_scales_expanded" in inspect.signature(
+        return "scales_expanded" in inspect.signature(
             TPMoEScratchPlan.bind
         ).parameters
     except Exception:
@@ -133,11 +135,11 @@ def _b12x_x4t_prefetch_supported(experts) -> bool:
 
 
 class MimoMxfp4CsfScalePrefetch:
-    """Owner-carried MXFP4/X4T scale-prefetch state for one MiMo expert owner.
+    """Owner-carried MXFP4/CSF scale-prefetch state for one MiMo expert owner.
 
     Mirrors ``Nvfp4CsfConfig``'s scale_layers/scale_stream/scale_prefetch +
     moe_done/scales_ready pattern (nvfp4_csf.py), with Codex §9.3 corrections
-    for the shared 54 MiB per-rank X4T scratch:
+    for the shared per-rank scale scratch:
 
     * The overlap window is layer L+1's ATTENTION: after L's MoE completes
       (``moe_done``), the side stream expands L+1's scales into the shared
@@ -155,6 +157,16 @@ class MimoMxfp4CsfScalePrefetch:
       captured graph runs inline (flag never declared under capture).
     * Eligibility is per-row-type (``_batch_has_prefill_rows``): DFlash
       verification and pure-decode batches never arm (Codex 9.5).
+
+    2026-10-12 port (csfdelta): the mechanism now targets the NATIVE CSF
+    scale machinery the FlashInfer 97fde4bd5/7e5a142e9 bases installed in
+    place of the old X4T paired-program surface: an MXFP4-CSF prepared
+    payload carries an ``nvfp4_csf`` decoder whose ``decode_all`` is what
+    ``b12x_fused_moe.expand_scales`` drives on the side stream, and whose
+    per-call selective decode is what ``bind(..., scales_expanded=True)``
+    (the stock ``B12xExperts.scales_expanded`` flag) skips. The class and
+    env names keep their X4T-era spelling for launcher compatibility; the
+    owner capability attribute ``x4t_scale_prefetch`` is unchanged.
 
     PP1, no ubatching, no concurrent forwards sharing the owner (enforced by
     the shared method's PP1/no-ubatching requirement). IDs/events/streams are
@@ -284,7 +296,7 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
         if activation_mode not in ("a16", "a8"):
             raise ValueError("MXFP4-CSF requires A16 or MXFP8 activations")
         self.activation_mode = activation_mode
-        # Set at weight-load time when the owner arms the X4T scale prefetch.
+        # Set at weight-load time when the owner arms the CSF scale prefetch.
         self.scale_prefetch_owner = None
         parallel = moe.moe_parallel_config
         if (
@@ -402,7 +414,7 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
             MoEPrepareAndFinalizeNoDPEPModular(), backend
         )
         self.backend, self.prepared = backend, prepared
-        # MiMo-owned X4T scale prefetch (Codex §9.2/§9.3): default OFF, owner
+        # MiMo-owned CSF scale prefetch (Codex §9.2/§9.3): default OFF, owner
         # capability attribute only (never an isinstance check against the
         # MiMo config, which would be a circular import for non-MiMo owners).
         # Codex review fix: the two CUDA events exist only for an ARMED layer
@@ -413,7 +425,7 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
             getattr(self.owner, "x4t_scale_prefetch", False)
             and self.activation_mode == "a16"
             and envs.VLLM_B12X_MXFP4_CSF_SCALE_PREFETCH
-            and _b12x_x4t_prefetch_supported(prepared)
+            and _b12x_csf_prefetch_supported(prepared)
         ):
             state = getattr(self.owner, "scale_prefetch_state", None)
             if state is not None:
@@ -423,7 +435,7 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
                 state.register(self, device)
         logger.info(
             "MXFP4-CSF lossless MXFP4 layer %d rank %d/%d: %s activations, "
-            "compressed scales, shared scratch %d bytes, x4t-scale-prefetch=%s",
+            "compressed scales, shared scratch %d bytes, csf-scale-prefetch=%s",
             self.layer_index,
             rank,
             tp,
@@ -488,12 +500,12 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
         token = _forward_token()
         # Codex §9.3 point 3: consume-or-drop the pending prefetch, but always
         # WAIT it before this call: whether or not the generation matches, the
-        # side-stream expansion may be in flight over the same 54 MiB scratch
+        # side-stream expansion may be in flight over the same shared scratch
         # this call's inline expansion would overwrite.
         pending, owner.scale_prefetch = owner.scale_prefetch, None
         if pending is not None:
             stream.wait_event(pending[2])
-        self.backend.x4t_scales_expanded = (
+        self.backend.scales_expanded = (
             token is not None
             and pending is not None
             and (pending[:2] == (self.layer_index, token))
@@ -501,7 +513,7 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
         try:
             result = run()
         finally:
-            self.backend.x4t_scales_expanded = False
+            self.backend.scales_expanded = False
         following = owner.scale_layers.get(self.layer_index + 1)
         if (
             token is not None
@@ -550,32 +562,33 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
         return result
 
     def _expands(self, x: torch.Tensor) -> bool:
-        """Whether this call's consumers expand X4T scales inline.
+        """Whether this call's consumers decode CSF scales into the scratch.
 
-        Codex review fix (P1): eligibility is derived from the PREPARED X4T
-        CONSUMER, never from the NVFP4 knob. The reviewed commit consulted
+        Codex review fix (P1) carried over from the X4T design: eligibility
+        is derived from the PREPARED CSF PAYLOAD, never from the NVFP4 knob.
+        History: the reviewed commit consulted
         ``_w4a16_a4_prefill_enabled()`` (``B12X_W4A16_A4_PREFILL_MIN_TOKENS``,
         an NVFP4 switch) while the MiMo launcher sets
         ``B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS`` and leaves the NVFP4 knob
-        unset, so production MiMo never armed. For a prepared X4T W4A16
-        payload every consumer expands the routed experts' scales inline on
-        every call -- the A16 runners (small-M direct arm, packed/direct
-        route predecode) and the MXFP4 A4 prefill runner (its own
-        ``B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS`` admission) -- so the payload
-        retaining the paired-plane capability IS the eligibility, and the
-        knobs only pick WHICH consumer runs. A16 prefill expansion is an
-        explicitly supported case, not an NVFP4 side effect.
+        unset, so production MiMo never armed. On the 97fde4bd5-era bases
+        every consumer of a CSF payload consumes the shared native scale
+        grids: the per-call selective decode at launch fills them unless
+        ``bind(..., scales_expanded=True)`` skips it, and ALL routed
+        consumers -- the A16 runners (small-M direct arm, packed/direct
+        route) and the MXFP4 A4 prefill runner -- read the grids, so a
+        prepared payload retaining the ``nvfp4_csf`` decoder IS the
+        eligibility, and the knobs only pick WHICH consumer runs.
 
-        Codex §9.5 still holds: this says the consumer expands inline, not
-        that this call should arm -- the caller separately requires actual
-        prefill rows (``_batch_has_prefill_rows``) and CUDA-graph capture
-        excludes arming in ``apply``. Row classification uses the host
-        metadata's verification width (``num_spec_decode_tokens`` via
-        ``_spec_decode_query_width``), never
+        Codex §9.5 still holds: this says the consumer decodes into the
+        shared scratch, not that this call should arm -- the caller
+        separately requires actual prefill rows (``_batch_has_prefill_rows``)
+        and CUDA-graph capture excludes arming in ``apply``. Row
+        classification uses the host metadata's verification width
+        (``_spec_decode_query_width``), never
         ``_num_leading_decode_tokens`` (that helper assumes query width <= 4
         and reads ``query_start_loc.tolist()``; it is not a DFlash7
         classifier and is not used here).
         """
         prepared = getattr(self, "prepared", None)
-        capability = getattr(getattr(prepared, "_impl", None), "x4t_prefetch", None)
-        return capability is not None
+        decoder = getattr(getattr(prepared, "_impl", None), "nvfp4_csf", None)
+        return decoder is not None

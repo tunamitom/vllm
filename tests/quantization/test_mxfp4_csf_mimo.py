@@ -258,7 +258,7 @@ def test_mimo_hybrid_intent_with_csf_root_resolves(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# MXFP4/X4T scale prefetch (Codex §9.2/§9.3/§9.5): MiMo-owned orchestration.
+# MXFP4/CSF scale prefetch (Codex §9.2/§9.3/§9.5): MiMo-owned orchestration.
 # ---------------------------------------------------------------------------
 
 
@@ -267,8 +267,8 @@ def _stub_method(owner, index, *, backend=None, prepared=None):
 
     ``owner`` is the prefetch STATE (MimoMxfp4CsfScalePrefetch); the owner
     namespace mirrors MimoMxfp4CsfConfig's capability contract. ``prepared``
-    defaults to a fake X4T payload: a namespace whose ``_impl`` retains the
-    paired-plane capability, which is what the (fixed) eligibility derivation
+    defaults to a fake CSF payload: a namespace whose ``_impl`` retains the
+    native CSF decoder, which is what the (fixed) eligibility derivation
     and the load-time support check consult.
     """
     from vllm.models.deepseek_v4_1.mxfp4_csf import Mxfp4CsfMoEMethod
@@ -284,14 +284,14 @@ def _stub_method(owner, index, *, backend=None, prepared=None):
     method.layer_index = index
     method.scale_prefetch_owner = owner
     method.backend = backend if backend is not None else SimpleNamespace(
-        x4t_scales_expanded=False
+        scales_expanded=False
     )
     method.moe_done = SimpleNamespace(record=lambda stream: None)
     method.scales_ready = SimpleNamespace(record=lambda stream: None)
     method.prepared = (
         prepared
         if prepared is not None
-        else SimpleNamespace(_impl=SimpleNamespace(x4t_prefetch=object()))
+        else SimpleNamespace(_impl=SimpleNamespace(nvfp4_csf=object()))
     )
     method.moe_kernel = SimpleNamespace()
     return method
@@ -515,12 +515,12 @@ def test_prefetch_off_is_unarmed(monkeypatch):
     monkeypatch.setattr("vllm.envs.VLLM_B12X_MXFP4_CSF_SCALE_PREFETCH", False)
     state = MimoMxfp4CsfScalePrefetch()
     calls = []
-    backend = SimpleNamespace(x4t_scales_expanded=False)
+    backend = SimpleNamespace(scales_expanded=False)
     method = _stub_method(state, 3, backend=backend)
     # env OFF -> the method never registers (scale_prefetch_owner is None).
     method.scale_prefetch_owner = None
     method.moe_kernel = SimpleNamespace(
-        apply=lambda **_: calls.append(backend.x4t_scales_expanded) or "out"
+        apply=lambda **_: calls.append(backend.scales_expanded) or "out"
     )
     layer = SimpleNamespace(
         w13_weight=None,
@@ -548,11 +548,11 @@ def test_stale_generation_is_awaited_and_never_reused(monkeypatch):
     main = _arm_stub_cuda(monkeypatch)
     monkeypatch.setattr("vllm.envs.VLLM_B12X_MXFP4_CSF_SCALE_PREFETCH", True)
     state = MimoMxfp4CsfScalePrefetch()
-    backend = SimpleNamespace(x4t_scales_expanded=False)
+    backend = SimpleNamespace(scales_expanded=False)
     method = _stub_method(state, 3, backend=backend)
     seen = []
     method.moe_kernel = SimpleNamespace(
-        apply=lambda **_: seen.append(backend.x4t_scales_expanded)
+        apply=lambda **_: seen.append(backend.scales_expanded)
     )
     layer = SimpleNamespace(
         w13_weight=None,
@@ -578,7 +578,7 @@ def test_stale_generation_is_awaited_and_never_reused(monkeypatch):
     assert seen == [False], "stale generation must never be reused"
     assert state.scale_prefetch is None
     # The skip flag is cleared after the call (no leakage into the next one).
-    assert backend.x4t_scales_expanded is False
+    assert backend.scales_expanded is False
 
     # A matching generation IS consumed. The token must be created for the
     # SAME forward context the apply runs in (each step gets its own token).
@@ -589,7 +589,7 @@ def test_stale_generation_is_awaited_and_never_reused(monkeypatch):
     method.apply(layer, x, None, None, None, None)
     assert seen[-1] is True, "matching (layer, token) must consume the prefetch"
     assert fresh in main.waits
-    assert backend.x4t_scales_expanded is False, "flag must be cleared in finally"
+    assert backend.scales_expanded is False, "flag must be cleared in finally"
 
 
 def test_cancellation_clears_skip_flag_and_capture_clears_pending(monkeypatch):
@@ -600,7 +600,7 @@ def test_cancellation_clears_skip_flag_and_capture_clears_pending(monkeypatch):
     main = _arm_stub_cuda(monkeypatch)
     monkeypatch.setattr("vllm.envs.VLLM_B12X_MXFP4_CSF_SCALE_PREFETCH", True)
     state = MimoMxfp4CsfScalePrefetch()
-    backend = SimpleNamespace(x4t_scales_expanded=False)
+    backend = SimpleNamespace(scales_expanded=False)
     method = _stub_method(state, 3, backend=backend)
 
     def boom(**_):
@@ -619,7 +619,7 @@ def test_cancellation_clears_skip_flag_and_capture_clears_pending(monkeypatch):
     _step(monkeypatch, starts=[0, 8, 520])
     with pytest.raises(RuntimeError, match="forward failed"):
         method.apply(layer, x, None, None, None, None)
-    assert backend.x4t_scales_expanded is False, (
+    assert backend.scales_expanded is False, (
         "the skip flag must be cleared in finally even on a failed forward"
     )
 
@@ -720,7 +720,7 @@ def test_first_and_last_layer_handled(monkeypatch):
     calls = []
     last = _stub_method(state, 3)
     last.moe_kernel = SimpleNamespace(
-        apply=lambda **_: calls.append(last.backend.x4t_scales_expanded)
+        apply=lambda **_: calls.append(last.backend.scales_expanded)
     )
     state.scale_layers[3] = last
     layer = SimpleNamespace(
@@ -841,9 +841,9 @@ def test_expand_returns_false_never_publishes_a_pending_prefetch(monkeypatch):
     )
     # The next call waits it (scratch race protection) but never consumes it.
     seen = []
-    layers[4].backend = SimpleNamespace(x4t_scales_expanded=False)
+    layers[4].backend = SimpleNamespace(scales_expanded=False)
     layers[4].moe_kernel = SimpleNamespace(
-        apply=lambda **_: seen.append(layers[4].backend.x4t_scales_expanded)
+        apply=lambda **_: seen.append(layers[4].backend.scales_expanded)
     )
     _step(monkeypatch, starts=[0, 8, 520], spec_tokens=7, gdn_prefills=1)
     layers[4].apply(layer, x, None, None, None, None)
@@ -863,12 +863,12 @@ def test_production_mimo_environment_arms_and_consumes_one_prefetch(monkeypatch)
     environment. Nothing eligibility-related is patched here: the real
     _expands, the real _batch_has_prefill_rows (reading real-shaped
     query_start_loc/num_actual_tokens/max_query_len metadata and the
-    DFlash7 speculative config), the real _b12x_x4t_prefetch_supported, and
+    DFlash7 speculative config), the real _b12x_csf_prefetch_supported, and
     the real env readers.
     """
     from vllm.models.deepseek_v4_1.mxfp4_csf import (
         MimoMxfp4CsfScalePrefetch,
-        _b12x_x4t_prefetch_supported,
+        _b12x_csf_prefetch_supported,
         _forward_token,
     )
 
@@ -889,9 +889,9 @@ def test_production_mimo_environment_arms_and_consumes_one_prefetch(monkeypatch)
     )
 
     state = MimoMxfp4CsfScalePrefetch()
-    prepared = SimpleNamespace(_impl=SimpleNamespace(x4t_prefetch=object()))
-    # The real load-time support check accepts this prepared X4T payload.
-    assert _b12x_x4t_prefetch_supported(prepared) is True
+    prepared = SimpleNamespace(_impl=SimpleNamespace(nvfp4_csf=object()))
+    # The real load-time support check accepts this prepared CSF payload.
+    assert _b12x_csf_prefetch_supported(prepared) is True
     layers = {i: _stub_method(state, i, prepared=prepared) for i in (3, 4)}
     for method in layers.values():
         state.scale_layers[method.layer_index] = method
@@ -944,9 +944,9 @@ def test_production_mimo_environment_arms_and_consumes_one_prefetch(monkeypatch)
     # Layer 4 runs in the SAME forward: it waits the pending event and
     # CONSUMES the prefetch (per-call skip flag set, cleared afterwards).
     seen = []
-    layers[4].backend = SimpleNamespace(x4t_scales_expanded=False)
+    layers[4].backend = SimpleNamespace(scales_expanded=False)
     layers[4].moe_kernel = SimpleNamespace(
-        apply=lambda **_: seen.append(layers[4].backend.x4t_scales_expanded)
+        apply=lambda **_: seen.append(layers[4].backend.scales_expanded)
     )
     layers[4].apply(layer, x, None, None, None, None)
     assert layers[4].scales_ready in main.waits, (
@@ -955,7 +955,7 @@ def test_production_mimo_environment_arms_and_consumes_one_prefetch(monkeypatch)
     assert seen == [True], (
         "the matching (layer, token) generation must be consumed"
     )
-    assert layers[4].backend.x4t_scales_expanded is False, (
+    assert layers[4].backend.scales_expanded is False, (
         "the skip flag must be cleared in finally"
     )
     assert state.scale_prefetch is None

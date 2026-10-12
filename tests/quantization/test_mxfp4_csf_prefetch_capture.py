@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""X4T scale-prefetch capture-transition integration (Codex §10.1).
+"""CSF scale-prefetch capture-transition integration (Codex §10.1).
 
 GPU integration of the REAL orchestration: the actual
 ``MimoMxfp4CsfScalePrefetch`` owner state, real CUDA streams/events, a real
@@ -57,9 +57,9 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
 
-# Small admissible X4T geometry (Kimi-list): hidden % 256 == 0 and
-# intermediate % 128 == 0, usable by the source-native (w31) A16 decode arm
-# under real CUDA-graph capture.
+# Small admissible MXFP4-CSF geometry (Kimi-list): hidden % 256 == 0 and
+# intermediate % 128 == 0, usable by the source-native (w31) A16 native-scale
+# path under real CUDA-graph capture.
 H, N, E, TOPK = 3584, 256, 4, 2
 W13_ROWS, W13_COLS = 2 * N, H // 32
 W2_ROWS, W2_COLS = H, N // 32
@@ -67,9 +67,17 @@ W2_ROWS, W2_COLS = H, N // 32
 _FORWARD_TOKENS = itertools.count()
 
 
-def _planes(rows, columns, rotation, *, seed):
-    """Bounded e8m0 X4T scale batch (finite, nontrivial, sparse exceptions)."""
-    from b12x._lib.quant.x4t_scales import make_x4t_scale_batch
+def _planes(rows, columns, *, seed):
+    """Bounded e8m0 CSF slab planes (finite, nontrivial, sparse exceptions).
+
+    Builds the checkpoint's legacy ``"csf"`` encoding — per-16-row-slab base
+    bytes plus packed one-bit selector offsets, u24-position exception words
+    — batched over experts exactly the way ``_load_mxfp4_csf_weights`` does,
+    so ``prepare_weights`` routes through the native CSF-block preparation
+    (FlashInfer 97fde4bd5/7e5a142e9) and the payload carries a real
+    ``nvfp4_csf`` decoder for ``expand_scales`` to drive.
+    """
+    from b12x.loader._csf_source import CsfSource
 
     rng = np.random.default_rng(seed)
     fixed, exceptions = [], []
@@ -100,14 +108,17 @@ def _planes(rows, columns, rotation, *, seed):
             )
         )
         exceptions.append(torch.from_numpy(positions | (values << 24)))
-    return make_x4t_scale_batch(
-        fixed,
-        exceptions,
-        rows=rows,
-        columns=columns,
-        device="cuda",
-        exception_task_rows=64,
-        exception_row_rotation=rotation,
+    sizes = [int(t.numel()) for t in exceptions]
+    starts = torch.zeros(len(sizes) + 1, dtype=torch.int64)
+    torch.cumsum(torch.tensor(sizes, dtype=torch.int64), 0, out=starts[1:])
+    return CsfSource(
+        (torch.stack(fixed), torch.cat(exceptions)),
+        starts,
+        rows,
+        columns,
+        "mxfp4",
+        len(sizes),
+        encoding="csf",
     )
 
 
@@ -150,8 +161,8 @@ _ACTIVATION_CACHE: dict = {}
 
 class _Harness:
     """Two real ``Mxfp4CsfMoEMethod`` methods (one real owner, real streams)
-    over a real prepared b12x X4T payload, with the production ``apply()``
-    driven end-to-end.
+    over a real prepared b12x MXFP4-CSF payload, with the production
+    ``apply()`` driven end-to-end.
 
     Only the checkpoint loader is replaced (in-memory tensors); the method
     objects get exactly the attributes ``process_weights_after_loading``
@@ -175,8 +186,8 @@ class _Harness:
             torch.empty((E, W13_COLS, W13_ROWS), dtype=torch.uint8, device="cuda"),
             torch.empty((E, W2_COLS, W2_ROWS), dtype=torch.uint8, device="cuda"),
         )
-        fc1 = _planes(W13_ROWS, W13_COLS, 0, seed=1000)
-        fc2 = _planes(W2_ROWS, W2_COLS, 0, seed=1500)
+        fc1 = _planes(W13_ROWS, W13_COLS, seed=1000)
+        fc2 = _planes(W2_ROWS, W2_COLS, seed=1500)
         w13, w2 = _weights()
         plan_w = b12x_fused_moe.plan_weights(
             source=b12x_fused_moe.PackedSource(
@@ -235,7 +246,7 @@ class _Harness:
             )
             method.layer_index = index
             method.scale_prefetch_owner = self.owner
-            method.backend = SimpleNamespace(x4t_scales_expanded=False)
+            method.backend = SimpleNamespace(scales_expanded=False)
             method.moe_done = torch.cuda.Event()
             method.scales_ready = torch.cuda.Event()
             method.prepared = experts
@@ -255,7 +266,7 @@ class _Harness:
         out = torch.empty(tokens, H, dtype=torch.bfloat16, device="cuda")
         method = self._consumer_method
         consumer = bool(
-            method is not None and method.backend.x4t_scales_expanded
+            method is not None and method.backend.scales_expanded
         )
         binding = self.b12x_fused_moe.bind(
             self.exec_plan,
@@ -265,7 +276,7 @@ class _Harness:
             topk_ids=ids,
             output=out,
             input_scales_static=True,
-            **({"x4t_scales_expanded": True} if consumer else {}),
+            **({"scales_expanded": True} if consumer else {}),
         )
         self.b12x_fused_moe.run(binding=binding)
         return out
