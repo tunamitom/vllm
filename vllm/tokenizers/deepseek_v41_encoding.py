@@ -323,9 +323,14 @@ def render_message(
     thinking_mode: str,
     drop_thinking: bool = True,
     reasoning_effort: Union[str, int, None] = None,
+    last_user_idx: Optional[int] = None,
 ) -> str:
     """
     Render a single message at the given index into its V4.1 encoded string form.
+
+    ``last_user_idx`` may be supplied by encode_messages to avoid re-scanning the
+    conversation for every rendered message (the scan is O(n) over tool-only
+    suffixes); direct callers may leave it unset.
     """
     assert 0 <= index < len(messages)
     assert thinking_mode in ["chat", "thinking"], (
@@ -333,7 +338,8 @@ def render_message(
     )
 
     msg = messages[index]
-    last_user_idx = find_last_user_index(messages)
+    if last_user_idx is None:
+        last_user_idx = find_last_user_index(messages)
 
     role = msg.get("role")
     content = msg.get("content")
@@ -558,6 +564,8 @@ def encode_messages(
         num_to_render = len(messages)
         context_len = len(context)
 
+    last_user_idx = find_last_user_index(full_messages)
+
     for idx in range(num_to_render):
         prompt += render_message(
             idx + context_len,
@@ -565,6 +573,7 @@ def encode_messages(
             thinking_mode=thinking_mode,
             drop_thinking=effective_drop_thinking,
             reasoning_effort=reasoning_effort,
+            last_user_idx=last_user_idx,
         )
 
     return prompt

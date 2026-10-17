@@ -53,6 +53,13 @@ def _order_messages_like_v41_prompt(
     """
     if not all(isinstance(message, dict) for message in messages):
         return messages
+    # Pre-merged content_blocks cannot be represented faithfully by the marker
+    # pass (it models each message as one text index), and the encoder sorts
+    # tool_result blocks within such messages on its own. Keep arrival order for
+    # these structured histories rather than risk changing prompt text; image
+    # association for that shape remains a documented residual.
+    if any("content_blocks" in message for message in messages):
+        return messages
     markers: list[dict[str, Any]] = []
     for index, message in enumerate(messages):
         role = message.get("role")
@@ -60,7 +67,7 @@ def _order_messages_like_v41_prompt(
         if role == "tool":
             marker["tool_call_id"] = message.get("tool_call_id", "")
         tool_calls = message.get("tool_calls")
-        if role == "assistant" and isinstance(tool_calls, list):
+        if role == "assistant" and isinstance(tool_calls, (list, tuple)):
             marker["tool_calls"] = [{"id": _tool_call_id(call)} for call in tool_calls]
         if message.get("task") is not None:
             marker["task"] = message["task"]

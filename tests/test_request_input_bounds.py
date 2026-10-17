@@ -27,7 +27,7 @@ from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import BeamSearchParams
-from vllm.tokenizers import deepseek_v4_encoding, deepseek_v32_encoding
+from vllm.tokenizers import deepseek_v4_encoding, deepseek_v32_encoding, deepseek_v41_encoding
 from vllm.v1.engine.input_processor import InputProcessor
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
@@ -283,12 +283,15 @@ def test_chat_beam_conversion_accepts_n_at_sequence_cap(
 
 
 ENCODING_MODULES = [deepseek_v32_encoding, deepseek_v4_encoding]
+# V4.1 is included in the scan-bound coverage only: its prompt dialect and
+# error types differ from V4/V3.2, so the prompt-shape tests stay on those.
+SCAN_MODULES = [deepseek_v32_encoding, deepseek_v4_encoding, deepseek_v41_encoding]
 
 
 @pytest.mark.parametrize(
     "encoding_module",
-    ENCODING_MODULES,
-    ids=["deepseek_v32", "deepseek_v4"],
+    SCAN_MODULES,
+    ids=["deepseek_v32", "deepseek_v4", "deepseek_v41"],
 )
 def test_encode_messages_scans_last_user_once_per_conversation(
     monkeypatch: pytest.MonkeyPatch,
