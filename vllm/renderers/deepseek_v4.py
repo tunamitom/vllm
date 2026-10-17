@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# (2026-10-17) Tool-result image ordering fix, ported from the DeepSeek-V4.1
+# reference-encoder alignment work: messages are reordered to encoder render order
+# before images are collected, so an image inside a tool result stays with that
+# result when parallel results arrive out of call order. Prompt text unchanged.
+
+from typing import Any
 
 from vllm.config import VllmConfig
 from vllm.entrypoints.chat_utils import (
@@ -9,12 +15,71 @@ from vllm.entrypoints.chat_utils import (
     parse_chat_messages_async,
 )
 from vllm.tokenizers.deepseek_v4 import DeepseekV4Tokenizer
+from vllm.tokenizers.deepseek_v41_encoding import (
+    merge_tool_messages,
+    sort_tool_results_by_call_order,
+)
 from vllm.utils.async_utils import make_async
 
 from .base import BaseRenderer
 from .inputs import DictPrompt
 from .inputs.preprocess import parse_dec_only_prompt
 from .params import ChatParams
+
+
+def _tool_call_id(call: Any) -> str:
+    if not isinstance(call, dict):
+        return ""
+    function = call.get("function")
+    function_id = function.get("id", "") if isinstance(function, dict) else ""
+    return call.get("id") or function_id or ""
+
+
+def _order_messages_like_v41_prompt(
+    messages: list[ChatCompletionMessageParam],
+) -> list[ChatCompletionMessageParam]:
+    """Return messages with tool results in the order the V4.1 encoder renders them.
+
+    The V4.1 encoder merges consecutive user and tool messages into one user
+    turn and sorts that turn's tool results by the call order of the preceding
+    assistant message. Multimodal items are collected in message order, and the
+    V4.1 processor assigns the i-th image to the i-th image placeholder, so
+    messages must be parsed in rendered order for images inside tool results to
+    stay with their results. The prompt text does not change: the encoder's
+    sort is a no-op on a turn that is already in call order.
+
+    The order is computed by running the encoder's own merge and sort over
+    index markers, so it follows the encoder exactly.
+    """
+    if not all(isinstance(message, dict) for message in messages):
+        return messages
+    markers: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        marker: dict[str, Any] = {"role": role, "content": index}
+        if role == "tool":
+            marker["tool_call_id"] = message.get("tool_call_id", "")
+        tool_calls = message.get("tool_calls")
+        if role == "assistant" and isinstance(tool_calls, list):
+            marker["tool_calls"] = [{"id": _tool_call_id(call)} for call in tool_calls]
+        if message.get("task") is not None:
+            marker["task"] = message["task"]
+        markers.append(marker)
+
+    order: list[int] = []
+    for merged in sort_tool_results_by_call_order(merge_tool_messages(markers)):
+        blocks = merged.get("content_blocks")
+        if blocks is None:
+            order.append(merged["content"])
+            continue
+        for block in blocks:
+            order.append(
+                block["content"] if block["type"] == "tool_result" else block["text"]
+            )
+
+    if sorted(order) != list(range(len(messages))):
+        return messages
+    return [messages[index] for index in order]
 
 
 class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
@@ -32,11 +97,19 @@ class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
     def _apply_chat_template(self, *args, **kwargs):
         return self.get_tokenizer().apply_chat_template(*args, **kwargs)
 
+    def _order_for_prompt(
+        self, messages: list[ChatCompletionMessageParam]
+    ) -> list[ChatCompletionMessageParam]:
+        if self.model_config.tokenizer_mode == "deepseek_v41":
+            return _order_messages_like_v41_prompt(messages)
+        return messages
+
     def render_messages(
         self,
         messages: list[ChatCompletionMessageParam],
         params: ChatParams,
     ) -> tuple[list[ConversationMessage], DictPrompt]:
+        messages = self._order_for_prompt(messages)
         conversation, mm_data, mm_uuids = parse_chat_messages(
             messages,
             self.model_config,
@@ -64,6 +137,7 @@ class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
         messages: list[ChatCompletionMessageParam],
         params: ChatParams,
     ) -> tuple[list[ConversationMessage], DictPrompt]:
+        messages = self._order_for_prompt(messages)
         conversation, mm_data, mm_uuids = await parse_chat_messages_async(
             messages,
             self.model_config,
